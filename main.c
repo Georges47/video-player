@@ -1,15 +1,175 @@
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
+#include <SDL2/SDL.h>
 
-// Decode packets into frames
-static int decode_packet(const AVPacket *p_packet, AVCodecContext *p_codec_context, AVFrame *p_frame);
+const int SCREEN_WIDTH = 640;
+const int SCREEN_HEIGHT = 480;
 
-// Save a frame into a .ppm file
-static void save_frame(const unsigned char *buf, int wrap, int x_size, int y_size, const char *filename);
+int init_sdl(SDL_Window **p_window, SDL_Renderer **p_renderer) {
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) return -1;
 
-int main(int argc, const char *argv[]) {
+    *p_window = SDL_CreateWindow("Video player", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH,
+                                 SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
+    if (*p_window == NULL) {
+        SDL_Quit();
+        return -1;
+    }
+
+    *p_renderer = SDL_CreateRenderer(*p_window, -1, SDL_RENDERER_ACCELERATED);
+    if (*p_renderer== NULL) {
+        SDL_DestroyWindow(*p_window);
+        SDL_Quit();
+        return -1;
+    }
+
+    return 0;
+}
+
+SDL_Surface *frame_to_surface(const AVFrame *frame) {
+    if (frame->format != AV_PIX_FMT_RGB24) {
+        fprintf(stderr, "[ERROR] Unsupported pixel format: %d. Expected RGB24.\n", frame->format);
+        return NULL;
+    }
+
+    SDL_Surface *surface = SDL_CreateRGBSurfaceFrom(
+        frame->data[0],
+        frame->width,
+        frame->height,
+        24, // Bits per pixel (RGB24 = 24 bits)
+        frame->linesize[0], // Pitch (number of bytes per row)
+        0x0000FF, 0x00FF00, 0xFF0000, 0 // Masks for RGB colors
+    );
+
+    if (!surface) {
+        fprintf(stderr, "[ERROR] Unable to create SDL_Surface: %s\n", SDL_GetError());
+        return NULL;
+    }
+
+    return surface;
+}
+
+int show_frame(SDL_Renderer *p_renderer, const AVFrame *p_frame) {
+    SDL_Delay(10);
+
+    SDL_Surface *p_surface = frame_to_surface(p_frame);
+    if (!p_surface) {
+        fprintf(stderr, "[ERROR] Could not to create a surface from frame: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    SDL_Texture *p_texture = SDL_CreateTextureFromSurface(p_renderer, p_surface);
+    SDL_FreeSurface(p_surface); // Surface no longer needed after creating the texture
+    if (!p_texture) {
+        fprintf(stderr, "[ERROR] Could not create texture: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    if (SDL_RenderClear(p_renderer) != 0) {
+        fprintf(stderr, "[ERROR] Could not clear the renderer: %s\n", SDL_GetError());
+        SDL_DestroyTexture(p_texture);
+        return -1;
+    }
+
+    if (SDL_RenderCopy(p_renderer, p_texture, NULL, NULL)) {
+        fprintf(stderr, "[ERROR] Could not copy the texture to the renderer: %s\n", SDL_GetError());
+        SDL_DestroyTexture(p_texture);
+        return -1;
+    }
+
+    SDL_RenderPresent(p_renderer);
+    SDL_DestroyTexture(p_texture);
+
+    return 0;
+}
+
+int close_sdl(SDL_Window *p_window, SDL_Renderer *p_renderer) {
+    SDL_DestroyWindow(p_window);
+    SDL_DestroyRenderer(p_renderer);
+    SDL_Quit();
+    return 0;
+}
+
+int decode_packet(const AVPacket *p_packet, AVCodecContext *p_codec_context, AVFrame *p_frame,
+                  SDL_Renderer *p_renderer) {
+    // Send the packet as input to the decoder
+    int response = avcodec_send_packet(p_codec_context, p_packet);
+    if (response < 0) {
+        fprintf(stderr, "[ERROR] Could not send a packet to the codec: %s\n", av_err2str(response));
+        return response;
+    }
+
+    // Create scaling context to convert from source format to RGB24
+    struct SwsContext *sws_context = sws_getContext(
+        p_codec_context->width, p_codec_context->height, p_codec_context->pix_fmt,
+        p_codec_context->width, p_codec_context->height, AV_PIX_FMT_RGB24,
+        SWS_BILINEAR,NULL,NULL,NULL
+    );
+    if (!sws_context) {
+        fprintf(stderr, "[ERROR] Could not create scaling context\n");
+        return -1;
+    }
+
+    AVFrame *p_frame_rgb = av_frame_alloc();
+    if (!p_frame_rgb) {
+        fprintf(stderr, "[ERROR] Could not allocate memory for frame\n");
+        sws_freeContext(sws_context);
+        return -1;
+    }
+
+    p_frame_rgb->format = AV_PIX_FMT_RGB24;
+    p_frame_rgb->width = p_codec_context->width;
+    p_frame_rgb->height = p_codec_context->height;
+
+    if (av_frame_get_buffer(p_frame_rgb, 0) < 0) {
+        fprintf(stderr, "[ERROR] Could not allocate buffer for RGB frame\n");
+        sws_freeContext(sws_context);
+        av_frame_free(&p_frame_rgb);
+        return -1;
+    }
+
+    while (1) {
+        // Send the decoded output data from the codec to a frame
+        response = avcodec_receive_frame(p_codec_context, p_frame);
+        if (response == AVERROR(EAGAIN) || response == AVERROR_EOF) break;
+        if (response < 0) {
+            fprintf(stderr, "[ERROR] Could not receive a frame from the decoder: %s\n", av_err2str(response));
+            break;
+        }
+        if (sws_scale(sws_context, p_frame->data, p_frame->linesize, 0, p_frame->height, p_frame_rgb->data,
+                      p_frame_rgb->linesize) != p_frame->height) {
+            fprintf(stderr, "[ERROR] Scaling failed\n");
+            break;
+        }
+        show_frame(p_renderer, p_frame_rgb);
+        printf(
+            "Frame %d (type=%c, size=%d bytes, format=%d) pts %p key_frame %d [DTS %d]\n",
+            p_codec_context->frame_number,
+            av_get_picture_type_char(p_frame_rgb->pict_type),
+            p_frame_rgb->pkt_size,
+            p_frame_rgb->format,
+            &p_frame_rgb->pts,
+            p_frame_rgb->key_frame,
+            p_frame_rgb->coded_picture_number
+        );
+    }
+
+    // Cleanup
+    sws_freeContext(sws_context);
+    av_frame_free(&p_frame_rgb);
+
+    return 0;
+}
+
+int main(const int argc, const char *argv[]) {
     if (argc < 2) {
-        printf("You need to specify a media file\n");
+        fprintf(stderr, "[ERROR] You need to specify a media file\n");
+        return -1;
+    }
+
+    SDL_Window *p_window = NULL;
+    SDL_Renderer *p_renderer = NULL;
+    if (init_sdl(&p_window, &p_renderer) < 0) {
+        fprintf(stderr, "[ERROR] SDL could not initialize: %s\n", SDL_GetError());
         return -1;
     }
 
@@ -87,117 +247,18 @@ int main(int argc, const char *argv[]) {
 
     // Read the packets from the stream and decode them into frames
     while (av_read_frame(p_format_context, p_packet) >= 0) {
-        if (p_packet->stream_index == video_stream_index) {
-            if (decode_packet(p_packet, p_codec_context, p_frame) < 0) break;
-        }
+        if (p_packet->stream_index == video_stream_index)
+            if (decode_packet(p_packet, p_codec_context, p_frame, p_renderer) < 0)
+                break;
         av_packet_unref(p_packet);
+        av_frame_unref(p_frame);
     }
 
     printf("Cleaning up all the resources\n");
+    close_sdl(p_window, p_renderer);
     av_frame_free(&p_frame);
     av_packet_free(&p_packet);
     avformat_close_input(&p_format_context);
 
     return 0;
-}
-
-int decode_packet(const AVPacket *p_packet, AVCodecContext *p_codec_context, AVFrame *p_frame) {
-    // Send the packet as input to the decoder
-    int response = avcodec_send_packet(p_codec_context, p_packet);
-    if (response < 0) {
-        fprintf(stderr, "[ERROR] Could not send a packet to the codec: %s\n", av_err2str(response));
-        return response;
-    }
-
-    // Create scaling context to convert from source format to RGB24
-    struct SwsContext *sws_context = sws_getContext(
-        p_codec_context->width, p_codec_context->height, p_codec_context->pix_fmt,
-        p_codec_context->width, p_codec_context->height, AV_PIX_FMT_RGB24,
-        SWS_BILINEAR,NULL,NULL,NULL
-    );
-    if (!sws_context) {
-        fprintf(stderr, "[ERROR] Could not create scaling context\n");
-        return -1;
-    }
-
-    AVFrame *p_frame_rgb = av_frame_alloc();
-    if (!p_frame_rgb) {
-        fprintf(stderr, "[ERROR] Could not allocate memory for frame\n");
-        sws_freeContext(sws_context);
-        return -1;
-    }
-
-    p_frame_rgb->format = AV_PIX_FMT_RGB24;
-    p_frame_rgb->width = p_codec_context->width;
-    p_frame_rgb->height = p_codec_context->height;
-
-    int scaling_result = av_frame_get_buffer(p_frame_rgb, 0);
-    if (scaling_result < 0) {
-        fprintf(stderr, "[ERROR] Could not to allocate buffer for RGB frame: %s\n", av_err2str(scaling_result));
-        sws_freeContext(sws_context);
-        av_frame_free(&p_frame_rgb);
-        return scaling_result;
-    }
-
-    while (1) {
-        // Send the decoded output data from the codec to a frame
-        response = avcodec_receive_frame(p_codec_context, p_frame);
-        if (response == AVERROR(EAGAIN) || response == AVERROR_EOF) {
-            break;
-        }
-        if (response < 0) {
-            fprintf(stderr, "[ERROR] Could not receive a frame from the decoder: %s\n", av_err2str(response));
-            sws_freeContext(sws_context);
-            av_frame_free(&p_frame_rgb);
-            return response;
-        }
-        // Convert pixel format and scale to RGB24
-        scaling_result = sws_scale(
-            sws_context, // Scaling context
-            p_frame->data, // Source data
-            p_frame->linesize, // Source line sizes
-            0, // Start line
-            p_frame->height, // Number of lines to process
-            p_frame_rgb->data, // Target data
-            p_frame_rgb->linesize // Target line sizes
-        );
-        if (scaling_result != p_frame->height) {
-            fprintf(stderr, "[ERROR] Could not perform scaling");
-            sws_freeContext(sws_context);
-            av_frame_free(&p_frame_rgb);
-            return -1;
-        }
-        printf(
-            "Frame %d (type=%c, size=%d bytes, format=%d) pts %p key_frame %d [DTS %d]\n",
-            p_codec_context->frame_number,
-            av_get_picture_type_char(p_frame_rgb->pict_type),
-            p_frame_rgb->pkt_size,
-            p_frame_rgb->format,
-            &p_frame_rgb->pts,
-            p_frame_rgb->key_frame,
-            p_frame_rgb->coded_picture_number
-        );
-        char frame_filename[1024];
-        snprintf(frame_filename, sizeof(frame_filename), "%s-%d.ppm", "frame",
-                 p_codec_context->frame_number);
-        save_frame(p_frame_rgb->data[0], p_frame_rgb->linesize[0], p_frame_rgb->width,
-                   p_frame_rgb->height, frame_filename);
-    }
-
-    // Cleanup
-    sws_freeContext(sws_context);
-    av_frame_free(&p_frame_rgb);
-
-    return 0;
-}
-
-void save_frame(const unsigned char *buf, const int wrap, const int x_size, const int y_size,
-                const char *filename) {
-    FILE *f = fopen(filename, "w");
-    // Writing the minimal required header for a ppm file format (https://en.wikipedia.org/wiki/Netpbm_format#PPM_example)
-    fprintf(f, "P6\n%d %d\n%d\n", x_size, y_size, 255);
-    // Writing line by line
-    for (int i = 0; i < y_size; i++)
-        fwrite(buf + i * wrap, 1, x_size * 3, f);
-    fclose(f);
 }
