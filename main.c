@@ -41,31 +41,29 @@ int decode_packet(const AVPacket *p_packet, AVCodecContext *p_codec_context, AVF
         return -1;
     }
 
-    while (1) {
-        // Send the decoded output data from the codec to a frame
-        response = avcodec_receive_frame(p_codec_context, p_frame);
-        if (response == AVERROR(EAGAIN) || response == AVERROR_EOF) break;
-        if (response < 0) {
-            fprintf(stderr, "[ERROR] Could not receive a frame from the decoder: %s\n", av_err2str(response));
-            break;
-        }
-        if (sws_scale(sws_context, p_frame->data, p_frame->linesize, 0, p_frame->height, p_frame_rgb->data,
-                      p_frame_rgb->linesize) != p_frame->height) {
-            fprintf(stderr, "[ERROR] Scaling failed\n");
-            break;
-        }
-        show_frame(p_renderer, p_frame_rgb);
-        printf(
-            "Frame %d (type=%c, size=%d bytes, format=%d) pts %p key_frame %d [DTS %d]\n",
-            p_codec_context->frame_number,
-            av_get_picture_type_char(p_frame_rgb->pict_type),
-            p_frame_rgb->pkt_size,
-            p_frame_rgb->format,
-            &p_frame_rgb->pts,
-            p_frame_rgb->key_frame,
-            p_frame_rgb->coded_picture_number
-        );
+    // Send the decoded output data from the codec to a frame
+    response = avcodec_receive_frame(p_codec_context, p_frame);
+    if (response == AVERROR(EAGAIN) || response == AVERROR_EOF) return 0;
+    if (response < 0) {
+        // TODO. Is this actually an error???
+        fprintf(stderr, "[ERROR] Could not receive a frame from the decoder: %s\n", av_err2str(response));
+        return 0;
     }
+    if (sws_scale(sws_context, p_frame->data, p_frame->linesize, 0, p_frame->height, p_frame_rgb->data,
+                  p_frame_rgb->linesize) != p_frame->height) {
+        fprintf(stderr, "[ERROR] Scaling failed\n");
+    }
+    show_frame(p_renderer, p_frame_rgb);
+    printf(
+        "Frame %d (type=%c, size=%d bytes, format=%d) pts %p key_frame %d [DTS %d]\n",
+        p_codec_context->frame_number,
+        av_get_picture_type_char(p_frame_rgb->pict_type),
+        p_frame_rgb->pkt_size,
+        p_frame_rgb->format,
+        &p_frame_rgb->pts,
+        p_frame_rgb->key_frame,
+        p_frame_rgb->coded_picture_number
+    );
 
     // Cleanup
     sws_freeContext(sws_context);
@@ -82,6 +80,9 @@ int main(const int argc, const char *argv[]) {
 
     SDL_Window *p_window = NULL;
     SDL_Renderer *p_renderer = NULL;
+    SDL_Event event = {0};
+    int exit = 0;
+    int pause = 0;
     if (init_sdl(&p_window, &p_renderer, 640, 480) < 0) {
         fprintf(stderr, "[ERROR] SDL could not initialize: %s\n", SDL_GetError());
         return -1;
@@ -159,13 +160,31 @@ int main(const int argc, const char *argv[]) {
         return -1;
     }
 
-    // Read the packets from the stream and decode them into frames
-    while (av_read_frame(p_format_context, p_packet) >= 0) {
-        if (p_packet->stream_index == video_stream_index)
-            if (decode_packet(p_packet, p_codec_context, p_frame, p_renderer) < 0)
-                break;
-        av_packet_unref(p_packet);
-        av_frame_unref(p_frame);
+    while (!exit) {
+        if (SDL_PollEvent(&event)) {
+            switch (event.type) {
+                case SDL_QUIT:
+                    exit = 1;
+                    break;
+                case SDL_KEYDOWN:
+                    if (event.key.keysym.sym == SDLK_ESCAPE) exit = 1;
+                    if (event.key.keysym.sym == SDLK_SPACE) pause = pause == 1 ? 0 : 1;
+                    break;
+                case SDL_WINDOWEVENT:
+                    if (event.window.event == SDL_WINDOWEVENT_CLOSE) exit = 1;
+                    break;
+                default: break;
+            }
+        }
+        if (pause) continue;
+        // Read the packets from the stream and decode them into frames
+        if (av_read_frame(p_format_context, p_packet) >= 0) {
+            if (p_packet->stream_index == video_stream_index)
+                if (decode_packet(p_packet, p_codec_context, p_frame, p_renderer) < 0)
+                    break;
+            av_packet_unref(p_packet);
+            av_frame_unref(p_frame);
+        }
     }
 
     printf("Cleaning up all the resources\n");
