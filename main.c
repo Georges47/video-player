@@ -1,93 +1,7 @@
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 #include <SDL2/SDL.h>
-
-const int SCREEN_WIDTH = 640;
-const int SCREEN_HEIGHT = 480;
-
-int init_sdl(SDL_Window **p_window, SDL_Renderer **p_renderer) {
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) return -1;
-
-    *p_window = SDL_CreateWindow("Video player", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH,
-                                 SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
-    if (*p_window == NULL) {
-        SDL_Quit();
-        return -1;
-    }
-
-    *p_renderer = SDL_CreateRenderer(*p_window, -1, SDL_RENDERER_ACCELERATED);
-    if (*p_renderer== NULL) {
-        SDL_DestroyWindow(*p_window);
-        SDL_Quit();
-        return -1;
-    }
-
-    return 0;
-}
-
-SDL_Surface *frame_to_surface(const AVFrame *frame) {
-    if (frame->format != AV_PIX_FMT_RGB24) {
-        fprintf(stderr, "[ERROR] Unsupported pixel format: %d. Expected RGB24.\n", frame->format);
-        return NULL;
-    }
-
-    SDL_Surface *surface = SDL_CreateRGBSurfaceFrom(
-        frame->data[0],
-        frame->width,
-        frame->height,
-        24, // Bits per pixel (RGB24 = 24 bits)
-        frame->linesize[0], // Pitch (number of bytes per row)
-        0x0000FF, 0x00FF00, 0xFF0000, 0 // Masks for RGB colors
-    );
-
-    if (!surface) {
-        fprintf(stderr, "[ERROR] Unable to create SDL_Surface: %s\n", SDL_GetError());
-        return NULL;
-    }
-
-    return surface;
-}
-
-int show_frame(SDL_Renderer *p_renderer, const AVFrame *p_frame) {
-    SDL_Delay(10);
-
-    SDL_Surface *p_surface = frame_to_surface(p_frame);
-    if (!p_surface) {
-        fprintf(stderr, "[ERROR] Could not to create a surface from frame: %s\n", SDL_GetError());
-        return -1;
-    }
-
-    SDL_Texture *p_texture = SDL_CreateTextureFromSurface(p_renderer, p_surface);
-    SDL_FreeSurface(p_surface); // Surface no longer needed after creating the texture
-    if (!p_texture) {
-        fprintf(stderr, "[ERROR] Could not create texture: %s\n", SDL_GetError());
-        return -1;
-    }
-
-    if (SDL_RenderClear(p_renderer) != 0) {
-        fprintf(stderr, "[ERROR] Could not clear the renderer: %s\n", SDL_GetError());
-        SDL_DestroyTexture(p_texture);
-        return -1;
-    }
-
-    if (SDL_RenderCopy(p_renderer, p_texture, NULL, NULL)) {
-        fprintf(stderr, "[ERROR] Could not copy the texture to the renderer: %s\n", SDL_GetError());
-        SDL_DestroyTexture(p_texture);
-        return -1;
-    }
-
-    SDL_RenderPresent(p_renderer);
-    SDL_DestroyTexture(p_texture);
-
-    return 0;
-}
-
-int close_sdl(SDL_Window *p_window, SDL_Renderer *p_renderer) {
-    SDL_DestroyWindow(p_window);
-    SDL_DestroyRenderer(p_renderer);
-    SDL_Quit();
-    return 0;
-}
+#include "gui/sdl.h"
 
 int decode_packet(const AVPacket *p_packet, AVCodecContext *p_codec_context, AVFrame *p_frame,
                   SDL_Renderer *p_renderer) {
@@ -168,7 +82,7 @@ int main(const int argc, const char *argv[]) {
 
     SDL_Window *p_window = NULL;
     SDL_Renderer *p_renderer = NULL;
-    if (init_sdl(&p_window, &p_renderer) < 0) {
+    if (init_sdl(&p_window, &p_renderer, 640, 480) < 0) {
         fprintf(stderr, "[ERROR] SDL could not initialize: %s\n", SDL_GetError());
         return -1;
     }
@@ -185,7 +99,7 @@ int main(const int argc, const char *argv[]) {
         fprintf(stderr, "[ERROR] Could not open the input file (%s)\n", argv[1]);
         return -1;
     }
-    printf("Format: %s\nDuration: %lld us\nBit rate: %lld\n", p_format_context->iformat->name,
+    printf("Format: %s\nDuration: %ld us\nBit rate: %ld\n", p_format_context->iformat->name,
            p_format_context->duration, p_format_context->bit_rate);
 
     // Some formats do not have a header or do not store enough information there, avformat_find_stream_info tries to
@@ -208,7 +122,7 @@ int main(const int argc, const char *argv[]) {
             p_codec = p_local_codec;
             p_codec_parameters = p_local_codec_parameters;
         }
-        printf("- Codec %s ID %d bit rate %lld\n", p_local_codec->name, p_local_codec->id,
+        printf("- Codec %s ID %d bit rate %ld\n", p_local_codec->name, p_local_codec->id,
                p_local_codec_parameters->bit_rate);
     }
     if (video_stream_index == -1) {
